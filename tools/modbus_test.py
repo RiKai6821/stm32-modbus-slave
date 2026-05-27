@@ -83,15 +83,66 @@ def test_write_multi(client):
         return False
 
 
+def test_read_coils(client):
+    """测试读线圈（FC01）"""
+    print("\n[Test 5] 读线圈 0x0000 ~ 0x0007")
+    rr = client.read_coils(address=0x0000, count=8, slave=SLAVE_ID)
+    if rr.isError():
+        print(f"  失败: {rr}")
+        return False
+    print(f"  线圈[0..7] = {rr.bits[:8]}")
+    return True
+
+
+def test_write_coil(client):
+    """测试写单个线圈（FC05）"""
+    print("\n[Test 6] 写线圈 0x0000 = ON，然后 OFF")
+    wr = client.write_coil(address=0x0000, value=True, slave=SLAVE_ID)
+    if wr.isError():
+        print(f"  写 ON 失败: {wr}")
+        return False
+    rr = client.read_coils(address=0x0000, count=1, slave=SLAVE_ID)
+    if not rr.isError() and rr.bits[0]:
+        print(f"  写 ON 并回读成功")
+    else:
+        print(f"  写 ON 后回读不匹配")
+        return False
+
+    wr = client.write_coil(address=0x0000, value=False, slave=SLAVE_ID)
+    rr = client.read_coils(address=0x0000, count=1, slave=SLAVE_ID)
+    if not rr.isError() and not rr.bits[0]:
+        print(f"  写 OFF 并回读成功")
+        return True
+    print(f"  写 OFF 后回读不匹配")
+    return False
+
+
 def test_exception_illegal_addr(client):
     """测试异常响应：非法地址"""
-    print("\n[Test 5] 异常响应测试: 读非法地址 0xFFFF")
+    print("\n[Test 7] 异常响应测试: 读非法地址 0xFFFF")
     rr = client.read_holding_registers(address=0xFFFF, count=1, slave=SLAVE_ID)
     if rr.isError():
         print(f"  收到预期的异常响应: {rr}")
         return True
     else:
         print(f"  应该返回异常但没有")
+        return False
+
+
+def test_readonly_protection(client):
+    """测试只读保护：尝试写 0x0000（系统状态寄存器，只读）"""
+    print("\n[Test 8] 只读保护: 写寄存器 0x0000 应被拒绝")
+    wr = client.write_register(address=0x0000, value=0xDEAD, slave=SLAVE_ID)
+    if wr.isError():
+        print(f"  收到预期的拒绝响应（只读保护生效）: {wr}")
+        return True
+    else:
+        # 如果没有拒绝，验证值是否被修改
+        rr = client.read_holding_registers(address=0x0000, count=1, slave=SLAVE_ID)
+        if not rr.isError() and rr.registers[0] != 0xDEAD:
+            print(f"  值未被修改，只读保护通过（值: 0x{rr.registers[0]:04X}）")
+            return True
+        print(f"  只读保护无效，值被修改为 0x{rr.registers[0]:04X}")
         return False
 
 
@@ -137,7 +188,10 @@ def main():
         test_read_sim_data,
         test_write_single,
         test_write_multi,
+        test_read_coils,
+        test_write_coil,
         test_exception_illegal_addr,
+        test_readonly_protection,
         test_stress,
     ]
     

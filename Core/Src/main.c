@@ -41,7 +41,10 @@ int main(void)
     
     /* 初始化 MODBUS 协议栈 */
     Modbus_Init(&g_modbus, &huart1, &htim2);
-    
+
+    /* 0x0000-0x000F 为系统状态寄存器，主机只读 */
+    Modbus_SetReadonly(&g_modbus, 0x0010);
+
     /* 初始化寄存器示例数据 */
     Modbus_SetReg(&g_modbus, 0x0000, 0x0100);  /* 版本号 v1.0 */
     Modbus_SetReg(&g_modbus, 0x0001, 0);       /* 运行计数器 */

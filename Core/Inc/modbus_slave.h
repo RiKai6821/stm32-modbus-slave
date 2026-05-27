@@ -13,13 +13,17 @@
 #include <stdbool.h>
 
 /* ===== 用户可配置参数 ===== */
-#define MODBUS_SLAVE_ADDR       0x01    /* 从机地址 (1-247) */
-#define MODBUS_REG_COUNT        64      /* 保持寄存器数量 */
-#define MODBUS_RX_BUF_SIZE      256     /* 接收缓冲区大小 */
-#define MODBUS_TX_BUF_SIZE      256     /* 发送缓冲区大小 */
-#define MODBUS_MAX_REGS_PER_REQ 32      /* 单次请求最大寄存器数 */
+#define MODBUS_SLAVE_ADDR        0x01   /* 从机地址 (1-247) */
+#define MODBUS_REG_COUNT         64     /* 保持寄存器数量 */
+#define MODBUS_COIL_COUNT        64     /* 线圈数量（FC01/FC05） */
+#define MODBUS_RX_BUF_SIZE       256    /* 接收缓冲区大小 */
+#define MODBUS_TX_BUF_SIZE       256    /* 发送缓冲区大小 */
+#define MODBUS_MAX_REGS_PER_REQ  32     /* 单次请求最大寄存器数 */
+#define MODBUS_MAX_COILS_PER_REQ 64     /* 单次请求最大线圈数 */
 
 /* MODBUS 功能码 */
+#define MB_FUNC_READ_COILS      0x01
+#define MB_FUNC_WRITE_COIL      0x05
 #define MB_FUNC_READ_HOLDING    0x03
 #define MB_FUNC_WRITE_SINGLE    0x06
 #define MB_FUNC_WRITE_MULTI     0x10
@@ -48,11 +52,17 @@ typedef struct {
     uint8_t  tx_buf[MODBUS_TX_BUF_SIZE];
     uint16_t tx_len;
     
-    uint16_t holding_regs[MODBUS_REG_COUNT];  /* 保持寄存器 */
-    
+    uint16_t holding_regs[MODBUS_REG_COUNT];           /* 保持寄存器 */
+    uint8_t  coils[MODBUS_COIL_COUNT / 8];             /* 线圈（位打包，coil_n 在字节 n/8 的第 n%8 位） */
+
+    uint16_t readonly_end;  /* 保持寄存器只读范围 [0, readonly_end)，0 = 不保护 */
+
+    /* RS485 半双工方向控制引脚（DE/RE），NULL = 不使用 */
+    GPIO_TypeDef *rs485_port;
+    uint16_t      rs485_pin;
+
     volatile ModbusState_t state;
     
-    /* 统计信息（面试可以讲） */
     uint32_t frame_count;
     uint32_t crc_err_count;
     uint32_t exception_count;
@@ -88,14 +98,36 @@ void Modbus_OnRxByte(ModbusSlave_t *mb, uint8_t byte);
 void Modbus_OnTimeout(ModbusSlave_t *mb);
 
 /**
- * @brief  用户层：写寄存器（应用代码可主动更新寄存器值）
+ * @brief  设置只读保持寄存器范围：地址 [0, readonly_end) 拒绝主机写操作
+ */
+void Modbus_SetReadonly(ModbusSlave_t *mb, uint16_t readonly_end);
+
+/**
+ * @brief  配置 RS485 半双工方向控制引脚（DE/RE 合并到同一个引脚）
+ * @note   发送前 DE=高，发送完成后 DE=低（HAL_UART_Transmit 阻塞完成后立即拉低）
+ *         传入 NULL 表示不使用（全双工 TTL 模式）
+ */
+void Modbus_SetRS485Pin(ModbusSlave_t *mb, GPIO_TypeDef *port, uint16_t pin);
+
+/**
+ * @brief  用户层：写保持寄存器
  */
 void Modbus_SetReg(ModbusSlave_t *mb, uint16_t addr, uint16_t value);
 
 /**
- * @brief  用户层：读寄存器
+ * @brief  用户层：读保持寄存器
  */
 uint16_t Modbus_GetReg(ModbusSlave_t *mb, uint16_t addr);
+
+/**
+ * @brief  用户层：写线圈（0 = OFF，非 0 = ON）
+ */
+void Modbus_SetCoil(ModbusSlave_t *mb, uint16_t addr, uint8_t value);
+
+/**
+ * @brief  用户层：读线圈
+ */
+uint8_t Modbus_GetCoil(ModbusSlave_t *mb, uint16_t addr);
 
 /* ===== 工具函数 ===== */
 uint16_t Modbus_CRC16(const uint8_t *data, uint16_t length);
