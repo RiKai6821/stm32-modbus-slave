@@ -1,18 +1,19 @@
 /**
- * @file    modbus_slave.c
- * @brief   MODBUS RTU 从机协议栈实现
+ * @file  modbus_slave.c
+ * @brief MODBUS RTU 从机协议栈实现 (HAL 无关版本)
+ *
+ * 不依赖任何 STM32 HAL/LL/CMSIS 头文件。
+ * 底层操作 (UART 发送, 定时器控制) 通过函数指针调用, 可在任意平台移植。
+ *
+ * MODBUS RTU 帧格式:
+ *   | Slave Addr | Func Code | Data ... | CRC Lo | CRC Hi |
+ *   |   1 byte   |  1 byte   | N bytes  | 1 byte | 1 byte |
  */
 
 #include "modbus_slave.h"
 #include <string.h>
 
-/* MODBUS RTU 帧格式:
- * | Slave Addr | Func Code | Data ...  | CRC Lo | CRC Hi |
- * |   1 byte   |  1 byte   | N bytes   | 1 byte | 1 byte |
- * 帧间隔 >= 3.5 字符时间（9600bps 时约 4ms，115200bps 时约 305us）
- */
-
-/* CRC16 查表法（标准 MODBUS CRC16，初始值 0xFFFF，多项式 0xA001） */
+/* ── CRC16 查表 (MODBUS 标准, 初始值 0xFFFF, 多项式 0xA001) ── */
 static const uint16_t crc_table[256] = {
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
     0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
@@ -58,353 +59,287 @@ uint16_t Modbus_CRC16(const uint8_t *data, uint16_t length)
     return crc;
 }
 
-/* ===== 线圈位操作辅助 ===== */
+/* ── 线圈位操作 ──────────────────────────────────────────── */
 
 static void coil_set(ModbusSlave_t *mb, uint16_t addr, uint8_t val)
 {
-    uint8_t byte_idx = (uint8_t)(addr / 8);
-    uint8_t bit_mask = (uint8_t)(1u << (addr % 8));
-    if (val) {
-        mb->coils[byte_idx] |=  bit_mask;
-    } else {
-        mb->coils[byte_idx] &= ~bit_mask;
-    }
+    uint8_t mask = (uint8_t)(1u << (addr % 8u));
+    if (val) mb->coils[addr / 8u] |=  mask;
+    else     mb->coils[addr / 8u] &= ~mask;
 }
 
-static uint8_t coil_get(ModbusSlave_t *mb, uint16_t addr)
+static uint8_t coil_get(const ModbusSlave_t *mb, uint16_t addr)
 {
-    return (mb->coils[addr / 8] >> (addr % 8)) & 0x01u;
+    return (mb->coils[addr / 8u] >> (addr % 8u)) & 0x01u;
 }
 
-/* ===== 内部辅助函数 ===== */
+/* ── 异常响应 ────────────────────────────────────────────── */
 
-static void mb_reset_timer(ModbusSlave_t *mb)
-{
-    __HAL_TIM_SET_COUNTER(mb->htim, 0);
-    HAL_TIM_Base_Start_IT(mb->htim);
-}
-
-static void mb_stop_timer(ModbusSlave_t *mb)
-{
-    HAL_TIM_Base_Stop_IT(mb->htim);
-}
-
-static void mb_send_exception(ModbusSlave_t *mb, uint8_t func, uint8_t exc_code)
+static void mb_send_exception(ModbusSlave_t *mb, uint8_t func, uint8_t exc)
 {
     mb->tx_buf[0] = MODBUS_SLAVE_ADDR;
-    mb->tx_buf[1] = func | 0x80;  /* 异常响应：功能码最高位置 1 */
-    mb->tx_buf[2] = exc_code;
-    uint16_t crc = Modbus_CRC16(mb->tx_buf, 3);
-    mb->tx_buf[3] = crc & 0xFF;
-    mb->tx_buf[4] = (crc >> 8) & 0xFF;
-    mb->tx_len = 5;
+    mb->tx_buf[1] = func | 0x80u;
+    mb->tx_buf[2] = exc;
+    uint16_t crc  = Modbus_CRC16(mb->tx_buf, 3);
+    mb->tx_buf[3] = (uint8_t)(crc & 0xFFu);
+    mb->tx_buf[4] = (uint8_t)(crc >> 8);
+    mb->tx_len    = 5;
     mb->exception_count++;
 }
 
-/* 功能码 0x01：读线圈 */
+/* ── 功能码处理 ──────────────────────────────────────────── */
+
 static void mb_handle_read_coils(ModbusSlave_t *mb)
 {
-    uint16_t addr  = (mb->rx_buf[2] << 8) | mb->rx_buf[3];
-    uint16_t count = (mb->rx_buf[4] << 8) | mb->rx_buf[5];
+    uint16_t addr  = (uint16_t)((mb->rx_buf[2] << 8) | mb->rx_buf[3]);
+    uint16_t count = (uint16_t)((mb->rx_buf[4] << 8) | mb->rx_buf[5]);
 
     if (count == 0 || count > MODBUS_MAX_COILS_PER_REQ) {
-        mb_send_exception(mb, MB_FUNC_READ_COILS, MB_EXC_ILLEGAL_VALUE);
-        return;
+        mb_send_exception(mb, MB_FUNC_READ_COILS, MB_EXC_ILLEGAL_VALUE); return;
     }
     if (addr + count > MODBUS_COIL_COUNT) {
-        mb_send_exception(mb, MB_FUNC_READ_COILS, MB_EXC_ILLEGAL_ADDR);
-        return;
+        mb_send_exception(mb, MB_FUNC_READ_COILS, MB_EXC_ILLEGAL_ADDR);  return;
     }
 
-    /* 响应：地址 + 功能码 + 字节数 + 线圈字节（低位在先） */
-    uint8_t  byte_count = (uint8_t)((count + 7) / 8);
+    uint8_t  byte_count = (uint8_t)((count + 7u) / 8u);
     mb->tx_buf[0] = MODBUS_SLAVE_ADDR;
     mb->tx_buf[1] = MB_FUNC_READ_COILS;
     mb->tx_buf[2] = byte_count;
-
     memset(&mb->tx_buf[3], 0, byte_count);
-    for (uint16_t i = 0; i < count; i++) {
-        if (coil_get(mb, addr + i)) {
-            mb->tx_buf[3 + i / 8] |= (uint8_t)(1u << (i % 8));
-        }
-    }
 
-    uint16_t resp_len = 3 + byte_count;
-    uint16_t crc = Modbus_CRC16(mb->tx_buf, resp_len);
-    mb->tx_buf[resp_len]     = (uint8_t)(crc & 0xFF);
-    mb->tx_buf[resp_len + 1] = (uint8_t)(crc >> 8);
-    mb->tx_len = resp_len + 2;
+    for (uint16_t i = 0; i < count; i++) {
+        if (coil_get(mb, addr + i))
+            mb->tx_buf[3u + i / 8u] |= (uint8_t)(1u << (i % 8u));
+    }
+    uint16_t rlen = 3u + byte_count;
+    uint16_t crc  = Modbus_CRC16(mb->tx_buf, rlen);
+    mb->tx_buf[rlen]     = (uint8_t)(crc & 0xFFu);
+    mb->tx_buf[rlen + 1] = (uint8_t)(crc >> 8);
+    mb->tx_len = rlen + 2u;
 }
 
-/* 功能码 0x05：写单个线圈 */
 static void mb_handle_write_coil(ModbusSlave_t *mb)
 {
-    uint16_t addr  = (mb->rx_buf[2] << 8) | mb->rx_buf[3];
-    uint16_t value = (mb->rx_buf[4] << 8) | mb->rx_buf[5];
+    uint16_t addr  = (uint16_t)((mb->rx_buf[2] << 8) | mb->rx_buf[3]);
+    uint16_t value = (uint16_t)((mb->rx_buf[4] << 8) | mb->rx_buf[5]);
 
     if (addr >= MODBUS_COIL_COUNT) {
-        mb_send_exception(mb, MB_FUNC_WRITE_COIL, MB_EXC_ILLEGAL_ADDR);
-        return;
+        mb_send_exception(mb, MB_FUNC_WRITE_COIL, MB_EXC_ILLEGAL_ADDR);  return;
     }
-    /* MODBUS 规定：0xFF00 = ON，0x0000 = OFF，其他值非法 */
-    if (value != 0x0000 && value != 0xFF00) {
-        mb_send_exception(mb, MB_FUNC_WRITE_COIL, MB_EXC_ILLEGAL_VALUE);
-        return;
+    if (value != 0x0000u && value != 0xFF00u) {
+        mb_send_exception(mb, MB_FUNC_WRITE_COIL, MB_EXC_ILLEGAL_VALUE); return;
     }
 
-    coil_set(mb, addr, value == 0xFF00 ? 1 : 0);
+    coil_set(mb, addr, value == 0xFF00u ? 1u : 0u);
 
-    /* 响应：回显请求（标准 FC05 应答格式） */
     memcpy(mb->tx_buf, mb->rx_buf, 6);
-    uint16_t crc = Modbus_CRC16(mb->tx_buf, 6);
-    mb->tx_buf[6] = (uint8_t)(crc & 0xFF);
+    uint16_t crc  = Modbus_CRC16(mb->tx_buf, 6);
+    mb->tx_buf[6] = (uint8_t)(crc & 0xFFu);
     mb->tx_buf[7] = (uint8_t)(crc >> 8);
-    mb->tx_len = 8;
+    mb->tx_len    = 8;
 }
 
-/* 功能码 0x03：读保持寄存器 */
 static void mb_handle_read_holding(ModbusSlave_t *mb)
 {
-    uint16_t addr = (mb->rx_buf[2] << 8) | mb->rx_buf[3];
-    uint16_t count = (mb->rx_buf[4] << 8) | mb->rx_buf[5];
-    
-    /* 参数检查 */
+    uint16_t addr  = (uint16_t)((mb->rx_buf[2] << 8) | mb->rx_buf[3]);
+    uint16_t count = (uint16_t)((mb->rx_buf[4] << 8) | mb->rx_buf[5]);
+
     if (count == 0 || count > MODBUS_MAX_REGS_PER_REQ) {
-        mb_send_exception(mb, MB_FUNC_READ_HOLDING, MB_EXC_ILLEGAL_VALUE);
-        return;
+        mb_send_exception(mb, MB_FUNC_READ_HOLDING, MB_EXC_ILLEGAL_VALUE); return;
     }
     if (addr + count > MODBUS_REG_COUNT) {
-        mb_send_exception(mb, MB_FUNC_READ_HOLDING, MB_EXC_ILLEGAL_ADDR);
-        return;
+        mb_send_exception(mb, MB_FUNC_READ_HOLDING, MB_EXC_ILLEGAL_ADDR);  return;
     }
-    
-    /* 组装响应：地址 + 功能码 + 字节数 + 数据 + CRC */
+
     mb->tx_buf[0] = MODBUS_SLAVE_ADDR;
     mb->tx_buf[1] = MB_FUNC_READ_HOLDING;
-    mb->tx_buf[2] = count * 2;  /* 字节数 */
-    
+    mb->tx_buf[2] = (uint8_t)(count * 2u);
+
     for (uint16_t i = 0; i < count; i++) {
-        uint16_t val = mb->holding_regs[addr + i];
-        mb->tx_buf[3 + i * 2] = (val >> 8) & 0xFF;
-        mb->tx_buf[4 + i * 2] = val & 0xFF;
+        uint16_t v = mb->holding_regs[addr + i];
+        mb->tx_buf[3u + i * 2u] = (uint8_t)(v >> 8);
+        mb->tx_buf[4u + i * 2u] = (uint8_t)(v & 0xFFu);
     }
-    
-    uint16_t resp_len = 3 + count * 2;
-    uint16_t crc = Modbus_CRC16(mb->tx_buf, resp_len);
-    mb->tx_buf[resp_len]     = crc & 0xFF;
-    mb->tx_buf[resp_len + 1] = (crc >> 8) & 0xFF;
-    mb->tx_len = resp_len + 2;
+    uint16_t rlen = 3u + count * 2u;
+    uint16_t crc  = Modbus_CRC16(mb->tx_buf, rlen);
+    mb->tx_buf[rlen]     = (uint8_t)(crc & 0xFFu);
+    mb->tx_buf[rlen + 1] = (uint8_t)(crc >> 8);
+    mb->tx_len = rlen + 2u;
 }
 
-/* 功能码 0x06：写单个寄存器 */
 static void mb_handle_write_single(ModbusSlave_t *mb)
 {
-    uint16_t addr = (mb->rx_buf[2] << 8) | mb->rx_buf[3];
-    uint16_t value = (mb->rx_buf[4] << 8) | mb->rx_buf[5];
+    uint16_t addr  = (uint16_t)((mb->rx_buf[2] << 8) | mb->rx_buf[3]);
+    uint16_t value = (uint16_t)((mb->rx_buf[4] << 8) | mb->rx_buf[5]);
 
     if (addr >= MODBUS_REG_COUNT) {
-        mb_send_exception(mb, MB_FUNC_WRITE_SINGLE, MB_EXC_ILLEGAL_ADDR);
-        return;
+        mb_send_exception(mb, MB_FUNC_WRITE_SINGLE, MB_EXC_ILLEGAL_ADDR); return;
     }
-    if (mb->readonly_end > 0 && addr < mb->readonly_end) {
-        mb_send_exception(mb, MB_FUNC_WRITE_SINGLE, MB_EXC_ILLEGAL_ADDR);
-        return;
+    if (mb->readonly_end > 0u && addr < mb->readonly_end) {
+        mb_send_exception(mb, MB_FUNC_WRITE_SINGLE, MB_EXC_ILLEGAL_ADDR); return;
     }
-    
+
     mb->holding_regs[addr] = value;
-    
-    /* 响应：回显请求帧（地址 + 功能码 + 寄存器地址 + 值 + CRC） */
+
     memcpy(mb->tx_buf, mb->rx_buf, 6);
-    uint16_t crc = Modbus_CRC16(mb->tx_buf, 6);
-    mb->tx_buf[6] = crc & 0xFF;
-    mb->tx_buf[7] = (crc >> 8) & 0xFF;
-    mb->tx_len = 8;
+    uint16_t crc  = Modbus_CRC16(mb->tx_buf, 6);
+    mb->tx_buf[6] = (uint8_t)(crc & 0xFFu);
+    mb->tx_buf[7] = (uint8_t)(crc >> 8);
+    mb->tx_len    = 8;
 }
 
-/* 功能码 0x10：写多个寄存器 */
 static void mb_handle_write_multi(ModbusSlave_t *mb)
 {
-    uint16_t addr = (mb->rx_buf[2] << 8) | mb->rx_buf[3];
-    uint16_t count = (mb->rx_buf[4] << 8) | mb->rx_buf[5];
+    uint16_t addr       = (uint16_t)((mb->rx_buf[2] << 8) | mb->rx_buf[3]);
+    uint16_t count      = (uint16_t)((mb->rx_buf[4] << 8) | mb->rx_buf[5]);
     uint8_t  byte_count = mb->rx_buf[6];
 
-    if (count == 0 || count > MODBUS_MAX_REGS_PER_REQ || byte_count != count * 2) {
-        mb_send_exception(mb, MB_FUNC_WRITE_MULTI, MB_EXC_ILLEGAL_VALUE);
-        return;
+    if (count == 0 || count > MODBUS_MAX_REGS_PER_REQ || byte_count != count * 2u) {
+        mb_send_exception(mb, MB_FUNC_WRITE_MULTI, MB_EXC_ILLEGAL_VALUE); return;
     }
     if (addr + count > MODBUS_REG_COUNT) {
-        mb_send_exception(mb, MB_FUNC_WRITE_MULTI, MB_EXC_ILLEGAL_ADDR);
-        return;
+        mb_send_exception(mb, MB_FUNC_WRITE_MULTI, MB_EXC_ILLEGAL_ADDR);  return;
     }
-    if (mb->readonly_end > 0 && addr < mb->readonly_end) {
-        mb_send_exception(mb, MB_FUNC_WRITE_MULTI, MB_EXC_ILLEGAL_ADDR);
-        return;
+    if (mb->readonly_end > 0u && addr < mb->readonly_end) {
+        mb_send_exception(mb, MB_FUNC_WRITE_MULTI, MB_EXC_ILLEGAL_ADDR);  return;
     }
-    
+
     for (uint16_t i = 0; i < count; i++) {
-        uint16_t val = (mb->rx_buf[7 + i * 2] << 8) | mb->rx_buf[8 + i * 2];
-        mb->holding_regs[addr + i] = val;
+        mb->holding_regs[addr + i] = (uint16_t)((mb->rx_buf[7u + i * 2u] << 8)
+                                                | mb->rx_buf[8u + i * 2u]);
     }
-    
-    /* 响应：地址 + 功能码 + 起始地址 + 数量 + CRC */
+
     mb->tx_buf[0] = MODBUS_SLAVE_ADDR;
     mb->tx_buf[1] = MB_FUNC_WRITE_MULTI;
-    mb->tx_buf[2] = (addr >> 8) & 0xFF;
-    mb->tx_buf[3] = addr & 0xFF;
-    mb->tx_buf[4] = (count >> 8) & 0xFF;
-    mb->tx_buf[5] = count & 0xFF;
-    uint16_t crc = Modbus_CRC16(mb->tx_buf, 6);
-    mb->tx_buf[6] = crc & 0xFF;
-    mb->tx_buf[7] = (crc >> 8) & 0xFF;
-    mb->tx_len = 8;
+    mb->tx_buf[2] = (uint8_t)(addr >> 8);
+    mb->tx_buf[3] = (uint8_t)(addr & 0xFFu);
+    mb->tx_buf[4] = (uint8_t)(count >> 8);
+    mb->tx_buf[5] = (uint8_t)(count & 0xFFu);
+    uint16_t crc  = Modbus_CRC16(mb->tx_buf, 6);
+    mb->tx_buf[6] = (uint8_t)(crc & 0xFFu);
+    mb->tx_buf[7] = (uint8_t)(crc >> 8);
+    mb->tx_len    = 8;
 }
 
-/* ===== 公开接口 ===== */
+/* ── 公开接口 ────────────────────────────────────────────── */
 
-void Modbus_Init(ModbusSlave_t *mb, UART_HandleTypeDef *huart, TIM_HandleTypeDef *htim)
+void Modbus_Init(ModbusSlave_t *mb,
+                 void     (*send_fn)         (const uint8_t*, uint16_t),
+                 void     (*send_done_fn)     (void),
+                 void     (*timer_restart_fn) (void),
+                 void     (*timer_stop_fn)    (void),
+                 uint32_t (*get_us_fn)        (void))
 {
     memset(mb, 0, sizeof(ModbusSlave_t));
-    mb->huart = huart;
-    mb->htim = htim;
-    mb->state = MB_STATE_IDLE;
+    mb->send          = send_fn;
+    mb->send_done     = send_done_fn;
+    mb->timer_restart = timer_restart_fn;
+    mb->timer_stop    = timer_stop_fn;
+    mb->get_us        = get_us_fn;
+    mb->state         = MB_STATE_IDLE;
 }
 
 void Modbus_OnRxByte(ModbusSlave_t *mb, uint8_t byte)
 {
-    if (mb->state == MB_STATE_FRAME_READY || mb->state == MB_STATE_PROCESSING) {
-        return;  /* 上一帧还没处理完，丢弃新数据 */
-    }
-    
+    if (mb->state == MB_STATE_FRAME_READY || mb->state == MB_STATE_PROCESSING)
+        return;  /* 上帧未处理完, 丢弃新数据 */
+
     if (mb->rx_len < MODBUS_RX_BUF_SIZE) {
         mb->rx_buf[mb->rx_len++] = byte;
         mb->state = MB_STATE_RECEIVING;
-        mb_reset_timer(mb);  /* 每收到一字节，重置 3.5 字符超时定时器 */
+        mb->timer_restart();
     }
 }
 
 void Modbus_OnTimeout(ModbusSlave_t *mb)
 {
-    mb_stop_timer(mb);
-    if (mb->state == MB_STATE_RECEIVING && mb->rx_len >= 4) {
+    mb->timer_stop();
+    if (mb->state == MB_STATE_RECEIVING && mb->rx_len >= 4u) {
         mb->state = MB_STATE_FRAME_READY;
     } else {
-        /* 帧太短或状态异常，丢弃 */
         mb->rx_len = 0;
-        mb->state = MB_STATE_IDLE;
+        mb->state  = MB_STATE_IDLE;
     }
 }
 
 void Modbus_Poll(ModbusSlave_t *mb)
 {
-    uint8_t is_broadcast;
-    uint16_t recv_crc, calc_crc;
-    uint8_t  func;
-
     if (mb->state != MB_STATE_FRAME_READY) return;
 
     mb->state = MB_STATE_PROCESSING;
+
+    /* ── 延迟计时开始 ──────────────────────────────────────── */
+    uint32_t t0 = mb->get_us ? mb->get_us() : 0u;
+
     mb->frame_count++;
 
-    /* 1. 地址过滤：0x00 为广播（执行但不回应） */
-    is_broadcast = (mb->rx_buf[0] == 0x00);
-    if (!is_broadcast && mb->rx_buf[0] != MODBUS_SLAVE_ADDR) {
-        goto frame_end;
-    }
+    /* 1. 地址过滤: 0x00 = 广播 (执行但不回应) */
+    uint8_t is_broadcast = (mb->rx_buf[0] == 0x00u);
+    if (!is_broadcast && mb->rx_buf[0] != MODBUS_SLAVE_ADDR)
+        goto frame_done;
 
     /* 2. CRC 校验 */
-    recv_crc = (uint16_t)(mb->rx_buf[mb->rx_len - 2]) |
-               (uint16_t)(mb->rx_buf[mb->rx_len - 1] << 8);
-    calc_crc = Modbus_CRC16(mb->rx_buf, mb->rx_len - 2);
-    if (recv_crc != calc_crc) {
-        mb->crc_err_count++;
-        goto frame_end;
+    {
+        uint16_t recv_crc = (uint16_t)(mb->rx_buf[mb->rx_len - 2u])
+                          | (uint16_t)(mb->rx_buf[mb->rx_len - 1u] << 8);
+        uint16_t calc_crc = Modbus_CRC16(mb->rx_buf, mb->rx_len - 2u);
+        if (recv_crc != calc_crc) {
+            mb->crc_err_count++;
+            goto frame_done;
+        }
     }
 
     /* 3. 功能码分发 */
-    func = mb->rx_buf[1];
     mb->tx_len = 0;
-
-    switch (func) {
-        case MB_FUNC_READ_COILS:
-            mb_handle_read_coils(mb);
-            break;
-        case MB_FUNC_WRITE_COIL:
-            mb_handle_write_coil(mb);
-            break;
-        case MB_FUNC_READ_HOLDING:
-            mb_handle_read_holding(mb);
-            break;
-        case MB_FUNC_WRITE_SINGLE:
-            mb_handle_write_single(mb);
-            break;
-        case MB_FUNC_WRITE_MULTI:
-            mb_handle_write_multi(mb);
-            break;
+    switch (mb->rx_buf[1]) {
+        case MB_FUNC_READ_COILS:   mb_handle_read_coils(mb);   break;
+        case MB_FUNC_WRITE_COIL:   mb_handle_write_coil(mb);   break;
+        case MB_FUNC_READ_HOLDING: mb_handle_read_holding(mb); break;
+        case MB_FUNC_WRITE_SINGLE: mb_handle_write_single(mb); break;
+        case MB_FUNC_WRITE_MULTI:  mb_handle_write_multi(mb);  break;
         default:
-            mb_send_exception(mb, func, MB_EXC_ILLEGAL_FUNC);
+            mb_send_exception(mb, mb->rx_buf[1], MB_EXC_ILLEGAL_FUNC);
             break;
     }
 
-    /* 4. 发送响应（广播帧不回应） */
+    /* 4. 记录处理延迟 (构建响应帧的耗时, 不含实际发送时间) */
+    if (mb->get_us)
+        mb->last_proc_us = mb->get_us() - t0;
+
+    /* 5. 发送响应 (广播帧不回应) */
     if (mb->tx_len > 0 && !is_broadcast) {
         mb->state = MB_STATE_SENDING;
-
-        /* RS485 半双工：拉高 DE 使能发送 */
-        if (mb->rs485_port) {
-            HAL_GPIO_WritePin(mb->rs485_port, mb->rs485_pin, GPIO_PIN_SET);
-        }
-
-        HAL_UART_Transmit(mb->huart, mb->tx_buf, mb->tx_len, 100);
-
-        /* HAL_UART_Transmit 阻塞等待 TC，此时帧已完全发出，可安全拉低 DE */
-        if (mb->rs485_port) {
-            HAL_GPIO_WritePin(mb->rs485_port, mb->rs485_pin, GPIO_PIN_RESET);
-        }
+        mb->send(mb->tx_buf, mb->tx_len);
+        if (mb->send_done) mb->send_done();
     }
 
-frame_end:
+frame_done:
     mb->rx_len = 0;
     mb->state  = MB_STATE_IDLE;
 }
 
 void Modbus_SetReadonly(ModbusSlave_t *mb, uint16_t readonly_end)
 {
-    mb->readonly_end = (readonly_end <= MODBUS_REG_COUNT) ? readonly_end : MODBUS_REG_COUNT;
-}
-
-void Modbus_SetRS485Pin(ModbusSlave_t *mb, GPIO_TypeDef *port, uint16_t pin)
-{
-    mb->rs485_port = port;
-    mb->rs485_pin  = pin;
-    /* 初始化为接收状态（DE = 低） */
-    if (port) {
-        HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
-    }
-}
-
-void Modbus_SetCoil(ModbusSlave_t *mb, uint16_t addr, uint8_t value)
-{
-    if (addr < MODBUS_COIL_COUNT) {
-        coil_set(mb, addr, value ? 1 : 0);
-    }
-}
-
-uint8_t Modbus_GetCoil(ModbusSlave_t *mb, uint16_t addr)
-{
-    return (addr < MODBUS_COIL_COUNT) ? coil_get(mb, addr) : 0;
+    mb->readonly_end = (readonly_end <= MODBUS_REG_COUNT) ? readonly_end
+                                                          : (uint16_t)MODBUS_REG_COUNT;
 }
 
 void Modbus_SetReg(ModbusSlave_t *mb, uint16_t addr, uint16_t value)
 {
-    if (addr < MODBUS_REG_COUNT) {
-        mb->holding_regs[addr] = value;
-    }
+    if (addr < MODBUS_REG_COUNT) mb->holding_regs[addr] = value;
 }
 
 uint16_t Modbus_GetReg(ModbusSlave_t *mb, uint16_t addr)
 {
-    if (addr < MODBUS_REG_COUNT) {
-        return mb->holding_regs[addr];
-    }
-    return 0;
+    return (addr < MODBUS_REG_COUNT) ? mb->holding_regs[addr] : 0u;
+}
+
+void Modbus_SetCoil(ModbusSlave_t *mb, uint16_t addr, uint8_t value)
+{
+    if (addr < MODBUS_COIL_COUNT) coil_set(mb, addr, value ? 1u : 0u);
+}
+
+uint8_t Modbus_GetCoil(ModbusSlave_t *mb, uint16_t addr)
+{
+    return (addr < MODBUS_COIL_COUNT) ? coil_get(mb, addr) : 0u;
 }
