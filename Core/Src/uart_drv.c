@@ -96,3 +96,89 @@ void uart1_rxne_irq_disable(void)
 {
     USART1->CR1 &= ~USART_CR1_RXNEIE;
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ * DMA TX 实现（DMA1 Channel 4 → USART1_TX）
+ *
+ * DMA1 Channel 4 映射关系（STM32F103，RM0008 Table 78）：
+ *   DMA1 CH4 = USART1_TX
+ *
+ * CCR 寄存器字段（使用到的位）：
+ *   DIR    [4]  = 1  → 方向：Memory → Peripheral
+ *   MINC   [7]  = 1  → 内存地址自增（每发送一字节自增）
+ *   TCIE   [1]  = 1  → 传输完成中断使能
+ *   EN     [0]  = 1  → 通道使能（写入此位触发传输开始）
+ *
+ * 数据宽度（默认）：MSIZE = PSIZE = 8 bit（字节）
+ * 优先级：PL[9:8] = 10（High），高于 AHB 刷新，减少总线等待
+ * ──────────────────────────────────────────────────────────────── */
+
+static volatile uint8_t g_dma_tx_busy = 0u;   /* 1 = DMA 正在传输 */
+
+/* DMA1_Channel4_IRQHandler 在 main.c 中实现（需访问 g_modbus）。
+ * 这里提供一个弱定义保证链接成功。 */
+__attribute__((weak)) void DMA1_Channel4_IRQHandler(void) {}
+
+void uart1_dma_init(void)
+{
+    /* 使能 DMA1 总线时钟（AHB1 上）*/
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+
+    /* 预配置 DMA1 CH4（不使能，等到实际发送时再设 CMAR/CNDTR/EN）*/
+    DMA1_Channel4->CCR = 0u;                   /* 先禁用 */
+    DMA1_Channel4->CPAR = (uint32_t)&USART1->DR; /* 外设地址固定 */
+    DMA1_Channel4->CCR = DMA_CCR_DIR           /* M→P 方向      */
+                       | DMA_CCR_MINC          /* 内存地址自增  */
+                       | DMA_CCR_PL_1          /* 优先级 High   */
+                       | DMA_CCR_TCIE;         /* TC 中断使能   */
+
+    /* 使能 USART1 DMA 发送请求（DMAT 位）*/
+    USART1->CR3 |= USART_CR3_DMAT;
+
+    /* 配置 NVIC：DMA1_Channel4 优先级 = 2（低于 TIM2 和 USART1）*/
+    NVIC_SetPriority(DMA1_Channel4_IRQn, 2u);
+    NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+}
+
+void uart1_dma_send_buf(const uint8_t *buf, uint16_t len)
+{
+    /* RS485：DE 高 = 发送方向 */
+    GPIOA->BSRR = DE_PIN_MASK;
+
+    /* 确保上一次传输已完成（安全互斥）*/
+    while (g_dma_tx_busy);
+
+    g_dma_tx_busy = 1u;
+
+    /* 配置本次传输 */
+    DMA1_Channel4->CCR  &= ~DMA_CCR_EN;          /* 先禁用通道（必须先清零才能修改 CMAR/CNDTR）*/
+    DMA1_Channel4->CMAR  = (uint32_t)buf;        /* 内存起始地址 */
+    DMA1_Channel4->CNDTR = len;                   /* 传输字节数   */
+    DMA1_Channel4->CCR  |= DMA_CCR_EN;            /* 使能 → 传输立即开始 */
+
+    /* 函数立即返回，DMA 在后台传输 */
+}
+
+void uart1_dma_wait_tc(void)
+{
+    /* 等待 DMA TC（DMA1_Channel4_IRQHandler 中清除 busy 标志）*/
+    while (g_dma_tx_busy);
+
+    /* DMA TC 时最后一字节已进入 USART DR，但移位寄存器可能还在发送。
+     * 等待 USART TC = 移位寄存器也空了 = 线路完全静默 */
+    while (!(USART1->SR & USART_SR_TC));
+
+    /* 现在可以安全地拉低 DE，切换 RS485 到接收方向 */
+    GPIOA->BRR = DE_PIN_MASK;
+}
+
+/**
+ * @brief  外部调用：在 DMA1_Channel4_IRQHandler 中调用此函数。
+ *         清除 DMA TC 标志，复位 busy 状态。
+ */
+void uart1_dma_tc_irq_handler(void)
+{
+    /* 清除 DMA1 CH4 传输完成标志（IFCR.CTCIF4，bit 13）*/
+    DMA1->IFCR = DMA_IFCR_CTCIF4;
+    g_dma_tx_busy = 0u;
+}

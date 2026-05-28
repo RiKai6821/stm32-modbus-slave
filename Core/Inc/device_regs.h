@@ -75,15 +75,43 @@
 #define REG_CH4_LO_THR       0x0027u
 
 /* ── 采集配置区 ──────────────────────────────────────────── */
-#define REG_SAMPLE_INTV_MS   0x0030u   /* 采样间隔 ms */
-#define REG_AVG_COUNT        0x0031u   /* 均值次数 */
-#define REG_WATCHDOG_S       0x0032u   /* 看门狗秒数 */
+#define REG_SAMPLE_INTV_MS   0x0030u   /* 采样间隔 ms              */
+#define REG_AVG_COUNT        0x0031u   /* 均值次数                 */
+#define REG_WATCHDOG_S       0x0032u   /* 看门狗秒数               */
+#define REG_SAVE_CONFIG      0x0033u   /* 写 0x5A5A 触发 Flash 保存*/
+
+/* ── HardFault 诊断区（只读）────────────────────────────────
+ *  上电后若检测到 BKP 寄存器中有故障记录，则自动填充以下寄存器。
+ *  SCADA/主机可通过 FC03 远程读取，无需现场物理接触即可诊断故障。
+ *  ─────────────────────────────────────────────────────────
+ *  0x0040  fault_flag    RO   0xBAD1 = 有故障记录；0 = 正常
+ *  0x0041  fault_pc_lo   RO   故障 PC 低 16 位
+ *  0x0042  fault_pc_hi   RO   故障 PC 高 16 位
+ *  0x0043  fault_cfsr_lo RO   SCB->CFSR [15:0]  (内存/总线错误详情)
+ *  0x0044  fault_cfsr_hi RO   SCB->CFSR [31:16] (使用错误详情)
+ *  0x0045  fault_hfsr    RW   SCB->HFSR [15:0]；写任意值清除故障记录
+ * ────────────────────────────────────────────────────────── */
+#define REG_FAULT_FLAG       0x0040u
+#define REG_FAULT_PC_LO      0x0041u
+#define REG_FAULT_PC_HI      0x0042u
+#define REG_FAULT_CFSR_LO    0x0043u
+#define REG_FAULT_CFSR_HI    0x0044u
+#define REG_FAULT_HFSR       0x0045u   /* 写此寄存器 = 清除故障记录 */
 
 /* 总寄存器数 (需 >= 最高地址 + 1) */
-#define DEVICE_REG_TOTAL     0x0040u
+#define DEVICE_REG_TOTAL     0x0046u
+
+/* ── Flash 配置存储页 ─────────────────────────────────────
+ *  使用 Flash 最后一页（页 63，0x0800FC00-0x0800FFFF，1 KB）
+ *  存储掉电不丢失的用户配置（报警阈值 + 采样参数）。
+ *  格式：[magic:4B][version:2B][threshold×8:16B][config×3:6B][crc16:2B]
+ * ────────────────────────────────────────────────────────── */
+#define CFG_FLASH_PAGE_ADDR  0x0800FC00UL   /* Flash 页 63 起始地址 */
+#define CFG_FLASH_MAGIC      0xA5A5CDEFuL   /* 有效配置魔数 */
+#define CFG_SAVE_KEY         0x5A5Au         /* 写入 REG_SAVE_CONFIG 触发保存 */
 
 /**
- * @brief 初始化设备寄存器映射, 写入出厂默认值
+ * @brief 初始化设备寄存器映射，写入出厂默认值，并尝试从 Flash 加载已保存配置。
  * @param mb  已完成 Modbus_Init() 的协议栈句柄
  */
 void devregs_init(ModbusSlave_t *mb);
@@ -92,13 +120,29 @@ void devregs_init(ModbusSlave_t *mb);
  * @brief 周期更新测量数据和统计信息 (在主循环中每 ~100 ms 调用一次)
  * @param mb       协议栈句柄
  * @param tick_ms  当前毫秒计数 (SysTick)
- *
- * 完成:
- *   - 仿真 ADC 数据 (正弦波模拟 4 通道电压)
- *   - 报警阈值比较 → 更新 REG_STATUS 报警标志
- *   - 同步 MODBUS 统计 (帧计数, CRC 错误, 处理延迟) 到只读寄存器
- *   - 看门狗检查
  */
 void devregs_update(ModbusSlave_t *mb, uint32_t tick_ms);
+
+/**
+ * @brief  将当前报警阈值和采集配置保存到 Flash（掉电不丢失）。
+ *         先擦除页 63，然后写入 magic + 参数 + CRC16。
+ *         写入失败时 REG_STATUS bit[15] 置位报错。
+ * @param  mb  协议栈句柄（读取当前寄存器值）。
+ */
+void devregs_save_config(ModbusSlave_t *mb);
+
+/**
+ * @brief  从 Flash 读取已保存配置并写入寄存器。
+ *         若 magic 无效或 CRC16 错误，保持出厂默认值不变。
+ * @return 1 = 加载成功，0 = 无有效配置（使用出厂默认值）。
+ */
+int devregs_load_config(ModbusSlave_t *mb);
+
+/**
+ * @brief  将 HardFault 诊断数据从 BKP 寄存器同步到 Modbus 寄存器区。
+ *         上电时由 devregs_init() 自动调用。
+ * @param  mb  协议栈句柄。
+ */
+void devregs_load_fault_info(ModbusSlave_t *mb);
 
 #endif /* DEVICE_REGS_H */

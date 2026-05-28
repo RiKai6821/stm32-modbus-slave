@@ -1,6 +1,6 @@
 /**
  * @file  main.c
- * @brief STM32F103 MODBUS RTU 从机 — 4 通道电压采集模块
+ * @brief STM32F103 MODBUS RTU 从机 — 4 通道电压采集模块（v2.1）
  *
  * 硬件: STM32F103C8T6 (Blue Pill, 72 MHz)
  *
@@ -10,9 +10,15 @@
  *   PA10 - USART1 RX
  *   PC13 - 板载 LED (每收到一帧闪烁, 用于肉眼监控通信)
  *
+ * v2.1 新增：
+ *   - DMA TX：USART1_TX 通过 DMA1 CH4 非阻塞发送（消除 ~1.74 ms 忙等）
+ *   - Flash 持久化配置：报警阈值写入 Flash 页 63，掉电不丢失
+ *   - HardFault 诊断帧：故障 PC/CFSR/HFSR 保存到 BKP，主机可远程读取
+ *
  * 架构要点:
  *   - 时钟:  寄存器级 PLL 配置, HSE 8MHz × 9 = 72 MHz
  *   - UART:  uart_drv.c 直接操作 USART1 寄存器, RXNE 中断接收
+ *   - DMA TX: DMA1 CH4，TC 中断触发 DE 切换
  *   - 定时:  timer_drv.c 直接操作 TIM2, 单次模式检测帧结束
  *   - MODBUS: 协议栈通过函数指针调用驱动, 完全可移植
  *   - 延迟:  DWT->CYCCNT (Cortex-M3 周期计数器) 实现微秒精度统计
@@ -68,10 +74,62 @@ void USART1_IRQHandler(void)
 void TIM2_IRQHandler(void)
 {
     if (TIM2->SR & TIM_SR_UIF) {
-        TIM2->SR = ~TIM_SR_UIF;          /* 清中断标志 (写 0 清除) */
+        TIM2->SR = ~TIM_SR_UIF;
         Modbus_OnTimeout(&g_modbus);
-        GPIOC->ODR ^= GPIO_ODR_ODR13;   /* PC13 翻转: 收到一帧 */
+        GPIOC->ODR ^= GPIO_ODR_ODR13;
     }
+}
+
+/* ── DMA1 CH4 传输完成中断（USART1_TX DMA）────────────────── */
+void DMA1_Channel4_IRQHandler(void)
+{
+    uart1_dma_tc_irq_handler();   /* 清 TC 标志 + g_dma_tx_busy = 0 */
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * HardFault 诊断处理器
+ *
+ * 当发生非法内存访问、非法指令等 HardFault 时，Cortex-M3 自动将
+ * 以下寄存器压栈（异常帧）：
+ *   [SP+0]  R0       [SP+4]  R1      [SP+8]  R2     [SP+12] R3
+ *   [SP+16] R12      [SP+20] LR      [SP+24] PC     [SP+28] xPSR
+ *
+ * 汇编 stub 判断使用 MSP 还是 PSP（取决于 EXC_RETURN bit[2]），
+ * 将栈指针作为参数传给 C 处理函数。
+ * ──────────────────────────────────────────────────────────── */
+void HardFault_Handler_C(uint32_t *stack)
+{
+    uint32_t fault_pc   = stack[6];           /* 触发 fault 的指令地址 */
+    uint32_t fault_cfsr = SCB->CFSR;          /* 详细故障原因字 */
+    uint32_t fault_hfsr = SCB->HFSR;          /* HardFault 状态 */
+
+    /* 保存到 BKP 寄存器（NVIC_SystemReset 后依然保留）*/
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    PWR->CR |= PWR_CR_DBP;
+    BKP->DR1 = 0xBAD1u;                              /* 故障魔数 */
+    BKP->DR2 = (uint16_t)(fault_pc  & 0xFFFFu);
+    BKP->DR3 = (uint16_t)(fault_pc  >> 16u);
+    BKP->DR4 = (uint16_t)(fault_cfsr & 0xFFFFu);
+    BKP->DR5 = (uint16_t)(fault_cfsr >> 16u);
+    BKP->DR6 = (uint16_t)(fault_hfsr & 0xFFFFu);
+
+    /* 清除 CFSR（写 1 清零）防止下次错误判读混淆 */
+    SCB->CFSR = fault_cfsr;
+
+    /* 等待 BKP 写入完成后复位，Bootloader / 启动代码会上报故障 */
+    for (volatile int i = 0; i < 10000; i++);
+    NVIC_SystemReset();
+}
+
+__attribute__((naked)) void HardFault_Handler(void)
+{
+    __asm volatile(
+        "TST    LR, #4          \n"  /* EXC_RETURN bit[2]: 0=MSP,1=PSP */
+        "ITE    EQ              \n"
+        "MRSEQ  R0, MSP         \n"  /* 用 MSP */
+        "MRSNE  R0, PSP         \n"  /* 用 PSP */
+        "B      HardFault_Handler_C \n"
+    );
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -158,18 +216,21 @@ int main(void)
     /* USART1: 115200 bps, 8N1 */
     uart1_init(APB2_HZ, MODBUS_BAUD);
 
+    /* DMA1 CH4 → USART1_TX（非阻塞发送，消除约 1.74 ms 忙等）*/
+    uart1_dma_init();
+
     /* TIM2: 精确 3.5 字符超时 = 1750 μs @115200 bps */
     tim2_init_modbus(TIM2_CLK_HZ, MODBUS_BAUD);
 
-    /* ── 3. MODBUS 协议栈初始化 ─────────────────────────────── */
+    /* ── 3. MODBUS 协议栈初始化（使用 DMA TX 回调）────────── */
     Modbus_Init(&g_modbus,
-                uart1_send_buf,    /* send:          直接写 USART1->DR */
-                uart1_wait_tc,     /* send_done:     等待 TC + DE 拉低  */
-                tim2_restart,      /* timer_restart: 重置帧间隔定时器   */
-                tim2_stop,         /* timer_stop:    停止定时器          */
-                get_us);           /* get_us:        DWT 微秒时间戳      */
+                uart1_dma_send_buf, /* send:      DMA 非阻塞发送       */
+                uart1_dma_wait_tc,  /* send_done: 等待 DMA TC + DE 拉低 */
+                tim2_restart,       /* timer_restart                    */
+                tim2_stop,          /* timer_stop                       */
+                get_us);            /* get_us: DWT 微秒时间戳           */
 
-    /* ── 4. 设备寄存器初始化 ────────────────────────────────── */
+    /* ── 4. 设备寄存器初始化（含 Flash 配置加载 + 故障信息读取）*/
     devregs_init(&g_modbus);
 
     /* ── 5. 启动 UART 接收 ──────────────────────────────────── */

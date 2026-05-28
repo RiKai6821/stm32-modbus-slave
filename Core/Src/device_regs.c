@@ -69,12 +69,190 @@ static uint16_t sim_mcu_temp(float t_sec)
     return (uint16_t)(250.0f + 30.0f * sinf(0.02f * t_sec));
 }
 
+/* ─────────────────────────────────────────────────────────────────
+ * Flash 配置存储（页 63，0x0800FC00，1 KB）
+ *
+ * 数据布局（所有字段小端存储）：
+ *   偏移  大小  含义
+ *   0x00   4B   magic = 0xA5A5CDEF（有效标志）
+ *   0x04   2B   version（配置格式版本，当前 = 1）
+ *   0x06   2B   保留
+ *   0x08  16B   阈值 ch1_hi/ch2_hi/ch3_hi/ch4_hi/ch1_lo…ch4_lo
+ *   0x18   6B   采集配置 sample_intv_ms / avg_count / watchdog_s
+ *   0x1E   2B   CRC16-CCITT（覆盖 0x00 ~ 0x1D 共 30 字节）
+ *
+ * CRC16-CCITT（poly=0x1021，init=0xFFFF）用于检测 Flash 数据损坏。
+ * ──────────────────────────────────────────────────────────────── */
+
+#define CFG_VERSION        1u
+#define CFG_DATA_LEN       30u    /* magic + ver + rsv + thresholds + config */
+#define CFG_TOTAL_LEN      32u    /* CFG_DATA_LEN + CRC16(2B) */
+
+/* Flash 解锁魔数 */
+#define FLASH_KEY1  0x45670123UL
+#define FLASH_KEY2  0xCDEF89ABUL
+
+/* CRC16-CCITT（与 Xmodem 块验证使用相同算法）*/
+static uint16_t cfg_crc16(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)((uint16_t)data[i] << 8u);
+        for (int j = 0; j < 8; j++) {
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1u) ^ 0x1021u)
+                                  : (uint16_t)(crc << 1u);
+        }
+    }
+    return crc;
+}
+
+/* Flash 写一个半字（要求已解锁，目标地址已擦除）*/
+static int flash_write_hw(uint32_t addr, uint16_t data)
+{
+    uint32_t timeout = 0x100000u;
+    while ((FLASH->SR & FLASH_SR_BSY) && --timeout);
+    if (!timeout) return 0;
+
+    FLASH->CR |= FLASH_CR_PG;
+    *(__IO uint16_t *)addr = data;
+    timeout = 0x100000u;
+    while ((FLASH->SR & FLASH_SR_BSY) && --timeout);
+    FLASH->CR &= ~FLASH_CR_PG;
+    if (FLASH->SR & FLASH_SR_EOP) FLASH->SR = FLASH_SR_EOP;
+    return (*(volatile uint16_t *)addr == data) ? 1 : 0;
+}
+
+void devregs_save_config(ModbusSlave_t *mb)
+{
+    /* 构建配置字节数组 */
+    uint8_t buf[CFG_TOTAL_LEN];
+    memset(buf, 0, sizeof(buf));
+
+    uint32_t magic = CFG_FLASH_MAGIC;
+    memcpy(buf + 0,  &magic,        4u);
+    buf[4] = (uint8_t)CFG_VERSION;
+    buf[5] = 0; buf[6] = 0; buf[7] = 0;   /* version hi + reserved */
+
+    /* 阈值 8 × 2 bytes */
+    for (uint8_t i = 0; i < 4u; i++) {
+        uint16_t v = Modbus_GetReg(mb, REG_CH1_HI_THR + i);
+        buf[8  + i * 2u]     = (uint8_t)(v & 0xFFu);
+        buf[8  + i * 2u + 1] = (uint8_t)(v >> 8u);
+    }
+    for (uint8_t i = 0; i < 4u; i++) {
+        uint16_t v = Modbus_GetReg(mb, REG_CH1_LO_THR + i);
+        buf[16 + i * 2u]     = (uint8_t)(v & 0xFFu);
+        buf[16 + i * 2u + 1] = (uint8_t)(v >> 8u);
+    }
+
+    /* 采集配置 3 × 2 bytes */
+    uint16_t intv = Modbus_GetReg(mb, REG_SAMPLE_INTV_MS);
+    uint16_t avgn = Modbus_GetReg(mb, REG_AVG_COUNT);
+    uint16_t wdog = Modbus_GetReg(mb, REG_WATCHDOG_S);
+    buf[24] = (uint8_t)(intv & 0xFFu); buf[25] = (uint8_t)(intv >> 8u);
+    buf[26] = (uint8_t)(avgn & 0xFFu); buf[27] = (uint8_t)(avgn >> 8u);
+    buf[28] = (uint8_t)(wdog & 0xFFu); buf[29] = (uint8_t)(wdog >> 8u);
+
+    /* 追加 CRC16 */
+    uint16_t crc = cfg_crc16(buf, CFG_DATA_LEN);
+    buf[CFG_DATA_LEN]     = (uint8_t)(crc & 0xFFu);
+    buf[CFG_DATA_LEN + 1] = (uint8_t)(crc >> 8u);
+
+    /* 解锁 Flash */
+    if (FLASH->CR & FLASH_CR_LOCK) {
+        FLASH->KEYR = FLASH_KEY1;
+        FLASH->KEYR = FLASH_KEY2;
+    }
+    if (FLASH->CR & FLASH_CR_LOCK) {
+        /* 解锁失败：在状态字 bit[15] 设置错误标志 */
+        Modbus_SetReg(mb, REG_STATUS, Modbus_GetReg(mb, REG_STATUS) | 0x8000u);
+        return;
+    }
+
+    /* 擦除配置页 */
+    while (FLASH->SR & FLASH_SR_BSY);
+    FLASH->CR |= FLASH_CR_PER;
+    FLASH->AR  = CFG_FLASH_PAGE_ADDR;
+    FLASH->CR |= FLASH_CR_STRT;
+    while (FLASH->SR & FLASH_SR_BSY);
+    FLASH->CR &= ~FLASH_CR_PER;
+    if (FLASH->SR & FLASH_SR_EOP) FLASH->SR = FLASH_SR_EOP;
+
+    /* 写入数据（半字对齐）*/
+    int ok = 1;
+    for (uint16_t i = 0; i < CFG_TOTAL_LEN; i += 2u) {
+        uint16_t hw = (uint16_t)buf[i] | ((uint16_t)buf[i + 1] << 8u);
+        if (!flash_write_hw(CFG_FLASH_PAGE_ADDR + i, hw)) { ok = 0; break; }
+    }
+
+    FLASH->CR |= FLASH_CR_LOCK;
+
+    /* 保存失败时设置错误标志 */
+    if (!ok) {
+        Modbus_SetReg(mb, REG_STATUS, Modbus_GetReg(mb, REG_STATUS) | 0x8000u);
+    }
+}
+
+int devregs_load_config(ModbusSlave_t *mb)
+{
+    const uint8_t *p = (const uint8_t *)CFG_FLASH_PAGE_ADDR;
+
+    /* 验证魔数 */
+    uint32_t magic;
+    memcpy(&magic, p, 4u);
+    if (magic != CFG_FLASH_MAGIC) return 0;
+
+    /* 验证 CRC16 */
+    uint16_t stored_crc;
+    memcpy(&stored_crc, p + CFG_DATA_LEN, 2u);
+    uint16_t calc_crc = cfg_crc16(p, CFG_DATA_LEN);
+    if (stored_crc != calc_crc) return 0;
+
+    /* 加载报警阈值 */
+    for (uint8_t i = 0; i < 4u; i++) {
+        uint16_t v;
+        memcpy(&v, p + 8  + i * 2u, 2u);
+        Modbus_SetReg(mb, REG_CH1_HI_THR + i, v);
+        memcpy(&v, p + 16 + i * 2u, 2u);
+        Modbus_SetReg(mb, REG_CH1_LO_THR + i, v);
+    }
+
+    /* 加载采集配置 */
+    uint16_t intv, avgn, wdog;
+    memcpy(&intv, p + 24, 2u); Modbus_SetReg(mb, REG_SAMPLE_INTV_MS, intv);
+    memcpy(&avgn, p + 26, 2u); Modbus_SetReg(mb, REG_AVG_COUNT,       avgn);
+    memcpy(&wdog, p + 28, 2u); Modbus_SetReg(mb, REG_WATCHDOG_S,      wdog);
+
+    return 1;
+}
+
+void devregs_load_fault_info(ModbusSlave_t *mb)
+{
+    /* 使能 BKP 和 PWR 时钟访问 */
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    PWR->CR |= PWR_CR_DBP;
+
+    if (BKP->DR1 == 0xBAD1u) {
+        uint16_t pc_lo   = BKP->DR2;
+        uint16_t pc_hi   = BKP->DR3;
+        uint16_t cfsr_lo = BKP->DR4;
+        uint16_t cfsr_hi = BKP->DR5;
+        uint16_t hfsr    = BKP->DR6;
+        Modbus_SetReg(mb, REG_FAULT_FLAG,    0xBAD1u);
+        Modbus_SetReg(mb, REG_FAULT_PC_LO,   pc_lo);
+        Modbus_SetReg(mb, REG_FAULT_PC_HI,   pc_hi);
+        Modbus_SetReg(mb, REG_FAULT_CFSR_LO, cfsr_lo);
+        Modbus_SetReg(mb, REG_FAULT_CFSR_HI, cfsr_hi);
+        Modbus_SetReg(mb, REG_FAULT_HFSR,    hfsr);
+    }
+}
+
 void devregs_init(ModbusSlave_t *mb)
 {
     /* 固件版本 */
     Modbus_SetReg(mb, REG_FW_VER,        FIRMWARE_VERSION);
 
-    /* 报警阈值出厂默认 */
+    /* 报警阈值出厂默认（可能被 devregs_load_config 覆盖）*/
     Modbus_SetReg(mb, REG_CH1_HI_THR,    DEFAULT_HI_THRESHOLD);
     Modbus_SetReg(mb, REG_CH2_HI_THR,    DEFAULT_HI_THRESHOLD);
     Modbus_SetReg(mb, REG_CH3_HI_THR,    DEFAULT_HI_THRESHOLD);
@@ -87,10 +265,16 @@ void devregs_init(ModbusSlave_t *mb)
     /* 采集配置出厂默认 */
     Modbus_SetReg(mb, REG_SAMPLE_INTV_MS, DEFAULT_SAMPLE_INTV_MS);
     Modbus_SetReg(mb, REG_AVG_COUNT,      DEFAULT_AVG_COUNT);
-    Modbus_SetReg(mb, REG_WATCHDOG_S,     0);   /* 看门狗默认关闭 */
+    Modbus_SetReg(mb, REG_WATCHDOG_S,     0u);
 
     /* 设置只读区: [0x0000, DEV_READONLY_END) 主机不可写 */
     Modbus_SetReadonly(mb, DEV_READONLY_END);
+
+    /* 尝试从 Flash 恢复用户配置（覆盖上面的出厂默认值）*/
+    devregs_load_config(mb);
+
+    /* 加载上次 HardFault 诊断信息（若有）*/
+    devregs_load_fault_info(mb);
 }
 
 void devregs_update(ModbusSlave_t *mb, uint32_t tick_ms)
@@ -158,16 +342,47 @@ void devregs_update(ModbusSlave_t *mb, uint32_t tick_ms)
     uint16_t wdog_s = Modbus_GetReg(mb, REG_WATCHDOG_S);
     if (wdog_s > 0u) {
         if (mb->frame_count > 0u) {
-            /* 有新帧 → 更新看门狗时间戳 */
             static uint32_t s_prev_frame = 0;
             if (mb->frame_count != s_prev_frame) {
-                s_prev_frame   = mb->frame_count;
+                s_prev_frame      = mb->frame_count;
                 s_last_frame_seen = tick_ms;
             }
         }
-        /* 超时未收到任何帧 → 软件复位 */
         if ((tick_ms - s_last_frame_seen) > (uint32_t)wdog_s * 1000u) {
             NVIC_SystemReset();
+        }
+    }
+
+    /* ── Flash 配置保存（主机写 0x5A5A 到 REG_SAVE_CONFIG 触发）── */
+    if (Modbus_GetReg(mb, REG_SAVE_CONFIG) == CFG_SAVE_KEY) {
+        Modbus_SetReg(mb, REG_SAVE_CONFIG, 0u);  /* 立即清零，防止重复触发 */
+        devregs_save_config(mb);
+    }
+
+    /* ── HardFault 记录清除（主机写任意值到 REG_FAULT_HFSR）────── */
+    if (Modbus_GetReg(mb, REG_FAULT_FLAG) == 0xBAD1u) {
+        /* 检查 REG_FAULT_HFSR 是否被主机写过（由 Modbus 写操作置位）*/
+        /* 简化：检测该寄存器非零时视为清除请求 */
+        if (Modbus_GetReg(mb, REG_FAULT_HFSR) != 0u &&
+            Modbus_GetReg(mb, REG_FAULT_FLAG)  != 0u) {
+            /* 检查是否是主机写入的清除命令（非 0xBAD1 的值）*/
+            /* 此处用标志寄存器 = 0 代表"已清除"请求 */
+            if (Modbus_GetReg(mb, REG_FAULT_FLAG) == 0xBAD1u &&
+                (tick_ms % 1000u) < intv_ms) {   /* 仅在每秒初判一次 */
+                /* 清除 BKP 故障记录 */
+                RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+                PWR->CR |= PWR_CR_DBP;
+                BKP->DR1 = 0u;
+                BKP->DR2 = 0u; BKP->DR3 = 0u;
+                BKP->DR4 = 0u; BKP->DR5 = 0u; BKP->DR6 = 0u;
+                /* 清除 Modbus 寄存器区的故障信息 */
+                Modbus_SetReg(mb, REG_FAULT_FLAG,    0u);
+                Modbus_SetReg(mb, REG_FAULT_PC_LO,   0u);
+                Modbus_SetReg(mb, REG_FAULT_PC_HI,   0u);
+                Modbus_SetReg(mb, REG_FAULT_CFSR_LO, 0u);
+                Modbus_SetReg(mb, REG_FAULT_CFSR_HI, 0u);
+                Modbus_SetReg(mb, REG_FAULT_HFSR,    0u);
+            }
         }
     }
 }

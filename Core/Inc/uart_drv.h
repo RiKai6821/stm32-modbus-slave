@@ -54,4 +54,46 @@ void uart1_rxne_irq_enable(void);
 /** @brief 关闭 RXNE 中断 */
 void uart1_rxne_irq_disable(void);
 
+/* ─────────────────────────────────────────────────────────────────
+ * DMA TX 扩展接口（DMA1 Channel 4 → USART1_TX）
+ *
+ * 优势：
+ *   阻塞发送 20 字节 @115200 bps = 1.74 ms CPU 被占用（while(TXE) 忙等）
+ *   DMA 发送 = CPU 仅需 ~1 μs 配置 DMA 寄存器，其余交给 DMA 控制器，
+ *   主循环可继续处理其他任务（更新仿真数据、检查看门狗等）。
+ *
+ * 使用方式：
+ *   1. 启动时调用 uart1_dma_init() 一次。
+ *   2. 将 Modbus_Init() 的 send 回调替换为 uart1_dma_send_buf，
+ *      send_done 回调替换为 uart1_dma_wait_tc。
+ *   3. 确保发送缓冲区在整个传输过程中保持有效
+ *      （Modbus 协议栈内部的 g_tx_buf 满足此要求）。
+ * ──────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief  初始化 DMA1 Channel 4 用于 USART1_TX。
+ *         使能 DMA1 时钟，预配置传输方向和数据宽度，
+ *         使能 DMA1_CH4 传输完成中断（TC IRQ）。
+ * @note   须在 uart1_init() 之后调用。
+ */
+void uart1_dma_init(void);
+
+/**
+ * @brief  通过 DMA 非阻塞发送数据帧（同时拉高 DE）。
+ * @param  buf  发送缓冲区（在传输完成前必须保持有效）。
+ * @param  len  字节数。
+ * @note   函数立即返回，DMA 在后台传输。
+ *         调用结束后必须调用 uart1_dma_wait_tc() 才能拉低 DE。
+ */
+void uart1_dma_send_buf(const uint8_t *buf, uint16_t len);
+
+/**
+ * @brief  等待 DMA 传输完成 + USART TC，然后拉低 DE。
+ *
+ * DMA TC（传输完成中断）触发时，最后一字节已写入 USART->DR，
+ * 但移位寄存器可能尚未完全发送。等待 USART_SR_TC 确保线路静默
+ * 后再切换 RS485 方向。
+ */
+void uart1_dma_wait_tc(void);
+
 #endif /* UART_DRV_H */
