@@ -23,11 +23,20 @@ import time
 import math
 import sys
 import threading
-from pymodbus.server import StartSerialServer
-from pymodbus.device import ModbusDeviceIdentification
-from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
-from pymodbus.datastore import ModbusSequentialDataBlock
-from pymodbus.transaction import ModbusRtuFramer
+try:
+    # pymodbus 2.x
+    from pymodbus.server.sync import StartSerialServer
+    from pymodbus.device import ModbusDeviceIdentification
+    from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
+    from pymodbus.datastore import ModbusSequentialDataBlock
+    from pymodbus.transaction import ModbusRtuFramer
+except ImportError:
+    # pymodbus 3.x fallback
+    from pymodbus.server import StartSerialServer
+    from pymodbus.device import ModbusDeviceIdentification
+    from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
+    from pymodbus.datastore import ModbusSequentialDataBlock
+    from pymodbus.transaction import ModbusRtuFramer
 
 PORT    = '/tmp/tty_slave'
 BAUD    = 115200
@@ -59,6 +68,9 @@ REG_FAULT_CFSR_LO= 0x0043
 REG_FAULT_CFSR_HI= 0x0044
 REG_FAULT_HFSR   = 0x0045
 TOTAL_REGS       = 0x0046
+
+# 只读区上界：地址 [0x0000, DEV_READONLY_END) 不允许外部写入
+DEV_READONLY_END = 0x0020
 
 # 仿真 ADC 参数（与 device_regs.c 完全相同）
 SIM_CHANNELS = [
@@ -94,58 +106,82 @@ def update_loop():
         t    = time.time() - start_time
         regs = store.store['h']  # holding registers
 
+        # 固件内部写：绕过只读保护，直接调父类 setValues
+        # （STM32 固件可以随时更新自己的只读诊断寄存器，只有外部 Modbus 写才受限）
+        fw_set = ModbusSequentialDataBlock.setValues.__get__(regs, type(regs))
+
         # 通道电压
         mv = [sim_mv(ch, t) for ch in range(4)]
         for i, v in enumerate(mv):
-            regs.setValues(REG_CH1_MV + i + 1, [v])
+            fw_set(REG_CH1_MV + i + 1, [v])
 
         # MCU 温度（25℃ ± 3℃）
         temp_x10 = int(250 + 30 * math.sin(0.02 * t))
-        regs.setValues(REG_MCU_TEMP + 1, [temp_x10])
+        fw_set(REG_MCU_TEMP + 1, [temp_x10])
 
         # ADC 采样计数
         adc_cnt = (adc_cnt + 8) & 0xFFFF
-        regs.setValues(REG_ADC_COUNT + 1, [adc_cnt])
+        fw_set(REG_ADC_COUNT + 1, [adc_cnt])
 
-        # 报警检测
+        # 报警检测（读阈值用正常 getValues，阈值区可写，无需绕过）
         hi = [regs.getValues(REG_CH1_HI_THR + i + 1, 1)[0] for i in range(4)]
         lo = [regs.getValues(REG_CH1_LO_THR + i + 1, 1)[0] for i in range(4)]
         status = 0
         for i in range(4):
             if mv[i] > hi[i] or mv[i] < lo[i]:
                 status |= (1 << i)
-        regs.setValues(REG_STATUS + 1, [status])
+        fw_set(REG_STATUS + 1, [status])
 
-        # 运行时间和统计
-        regs.setValues(REG_UPTIME_S     + 1, [int(t) & 0xFFFF])
-        regs.setValues(REG_FRAME_COUNT  + 1, [frame_count & 0xFFFF])
-        regs.setValues(REG_LATENCY_US   + 1, [latency])
+        # 运行时间和统计（均在只读区，用 fw_set 绕过）
+        fw_set(REG_UPTIME_S     + 1, [int(t) & 0xFFFF])
+        fw_set(REG_FRAME_COUNT  + 1, [frame_count & 0xFFFF])
+        fw_set(REG_LATENCY_US   + 1, [latency])
         latency = clamp(latency + int(5 * math.sin(t * 3)), 150, 280)
 
         time.sleep(0.1)
 
 
+class ReadonlyProtectedBlock(ModbusSequentialDataBlock):
+    """只读区写保护（模拟 STM32 固件的 Modbus_SetReadonly() 行为）。
+    地址 [0x0000, DEV_READONLY_END) 写操作返回 False → pymodbus 返回 0x82 异常。
+    """
+    READONLY_END = DEV_READONLY_END   # = 0x0020
+
+    def validate(self, address, count=1):
+        return super().validate(address, count)
+
+    def setValues(self, address, values):
+        # address 是 1-based 内部索引，实际寄存器地址 = address - 1
+        reg_addr = address - 1
+        if reg_addr < self.READONLY_END:
+            return False   # 触发 pymodbus 的 IllegalAddress 异常响应
+        return super().setValues(address, values)
+
+
 def init_registers():
     """初始化寄存器（模拟 devregs_init()）"""
-    # 创建 holding register block（地址 0 开始，大小 TOTAL_REGS）
-    block = ModbusSequentialDataBlock(0, [0] * TOTAL_REGS)
+    # 创建 holding register block（地址 0 开始，大小 TOTAL_REGS），带只读保护
+    block = ReadonlyProtectedBlock(0, [0] * TOTAL_REGS)
     ctx   = ModbusSlaveContext(hr=block, co=ModbusSequentialDataBlock(0, [0]*8))
 
-    # 出厂默认值
-    block.setValues(REG_FW_VER       + 1, [0x0200])  # v2.0
+    # 出厂默认值（直接调父类 setValues 绕过只读保护，用于初始化）
+    super_set = ModbusSequentialDataBlock.setValues.__get__(block, ReadonlyProtectedBlock)
+
+    # 只读区 (addr < 0x0020) 用 super_set 初始化，绕过只读拦截
+    super_set(REG_FW_VER       + 1, [0x0200])   # 0x0001: 固件版本 v2.0
+    # 可写区 (addr >= 0x0020) 直接 setValues
     block.setValues(REG_CH1_HI_THR   + 1, [9000, 9000, 9000, 9000])
-    block.setValues(REG_CH1_LO_THR   + 1, [500, 500, 500, 500])
+    block.setValues(REG_CH1_LO_THR   + 1, [500,  500,  500,  500 ])
     block.setValues(REG_SAMPLE_INTV  + 1, [100])
     block.setValues(REG_AVG_COUNT    + 1, [8])
     block.setValues(REG_WATCHDOG_S   + 1, [0])
 
-    # 模拟上电检测到 HardFault 记录（演示用）
-    # 模拟一次空指针访问：PC=0x0800_1A2C, CFSR bit4=STKERR（栈错误）
-    block.setValues(REG_FAULT_FLAG   + 1, [0xBAD1])
-    block.setValues(REG_FAULT_PC_LO  + 1, [0x1A2C])
-    block.setValues(REG_FAULT_PC_HI  + 1, [0x0800])
-    block.setValues(REG_FAULT_CFSR_LO+ 1, [0x0400])  # BFSR: STKERR
-    block.setValues(REG_FAULT_CFSR_HI+ 1, [0x0000])
+    # HardFault 诊断区 (0x0040–0x0045, 只读)
+    super_set(REG_FAULT_FLAG   + 1, [0xBAD1])    # 有故障记录
+    super_set(REG_FAULT_PC_LO  + 1, [0x1A2C])    # 故障 PC 低16位
+    super_set(REG_FAULT_PC_HI  + 1, [0x0800])    # 故障 PC 高16位 → PC=0x08001A2C
+    super_set(REG_FAULT_CFSR_LO+ 1, [0x0400])    # SCB->CFSR BFSR: STKERR（栈错误）
+    super_set(REG_FAULT_CFSR_HI+ 1, [0x0000])
     block.setValues(REG_FAULT_HFSR   + 1, [0x4000_0000 & 0xFFFF])  # FORCED
 
     return ctx
@@ -154,9 +190,19 @@ def init_registers():
 def main():
     global store
 
+    import argparse
+    parser = argparse.ArgumentParser(description='STM32 Modbus RTU 从机模拟器')
+    parser.add_argument('--port', default=PORT,
+                        help='从机串口路径（默认: %(default)s）')
+    parser.add_argument('--master-port', default=None,
+                        help='提示用户用哪个主机端口运行 modbus_test.py')
+    args = parser.parse_args()
+    slave_port  = args.port
+    master_port = args.master_port or slave_port.replace('slave', 'master').replace('stm32', 'pc')
+
     print("=" * 55)
     print("  STM32 Modbus RTU Slave Simulator v2.1")
-    print(f"  Port: {PORT}  Baud: {BAUD}  Slave ID: {UNIT_ID}")
+    print(f"  Port: {slave_port}  Baud: {BAUD}  Slave ID: {UNIT_ID}")
     print("=" * 55)
     print()
     print("Register map (subset):")
@@ -172,11 +218,12 @@ def main():
     server_ctx = ModbusServerContext(slaves={UNIT_ID: ctx}, single=False)
 
     # 启动后台数据更新线程
-    t = threading.Thread(target=update_loop, daemon=True)
-    t.start()
+    th = threading.Thread(target=update_loop, daemon=True)
+    th.start()
     print(f"[OK] Simulation thread started (100ms update cycle)")
-    print(f"[OK] Modbus RTU server starting on {PORT}...")
-    print(f"     Run: SERIAL_PORT={PORT.replace('slave', 'master')} python tools/modbus_test.py")
+    print(f"[OK] Modbus RTU server starting on {slave_port}...")
+    print(f"     In another terminal run:")
+    print(f"     SERIAL_PORT={master_port} python tools/modbus_test.py")
     print()
 
     identity = ModbusDeviceIdentification()
@@ -189,7 +236,7 @@ def main():
         context=server_ctx,
         framer=ModbusRtuFramer,
         identity=identity,
-        port=PORT,
+        port=slave_port,
         baudrate=BAUD,
         timeout=0.1,
     )

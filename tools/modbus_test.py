@@ -25,12 +25,17 @@ import time
 import sys
 import struct
 import statistics
-from pymodbus.client import ModbusSerialClient
+try:
+    from pymodbus.client.sync import ModbusSerialClient   # pymodbus 2.x
+except ImportError:
+    from pymodbus.client import ModbusSerialClient         # pymodbus 3.x
 from pymodbus.exceptions import ModbusException
 
 # ===== 配置 =====
-SERIAL_PORT = '/dev/cu.usbserial-XXXX'   # macOS: ls /dev/cu.*
-# SERIAL_PORT = 'COM3'                   # Windows
+# 优先读取环境变量（demo_modbus.sh 会设置），否则使用默认值
+import os
+SERIAL_PORT = os.environ.get('SERIAL_PORT', '/dev/cu.usbserial-XXXX')
+# Windows: SERIAL_PORT=COM3 python modbus_test.py
 BAUDRATE    = 115200
 SLAVE_ID    = 1
 TIMEOUT     = 1.0
@@ -64,13 +69,13 @@ REG_WATCHDOG_S    = 0x0032
 
 def read_regs(client, addr, count=1):
     """读保持寄存器, 返回寄存器列表或 None"""
-    rr = client.read_holding_registers(address=addr, count=count, slave=SLAVE_ID)
+    rr = client.read_holding_registers(address=addr, count=count, unit=SLAVE_ID)
     return None if rr.isError() else rr.registers
 
 
 def write_reg(client, addr, value):
     """写单个寄存器, 返回是否成功"""
-    wr = client.write_register(address=addr, value=value, slave=SLAVE_ID)
+    wr = client.write_register(address=addr, value=value, unit=SLAVE_ID)
     return not wr.isError()
 
 
@@ -166,7 +171,7 @@ def test_alarm_thresholds(client):
 def test_readonly_protection(client):
     """验证只读保护: 写 REG_FW_VER (0x0001) 应返回异常"""
     print("\n[Test 4] 只读保护")
-    wr = client.write_register(address=REG_FW_VER, value=0xDEAD, slave=SLAVE_ID)
+    wr = client.write_register(address=REG_FW_VER, value=0xDEAD, unit=SLAVE_ID)
     if wr.isError():
         print(f"  PASS: 收到预期异常响应 (只读区写保护生效): {wr}")
         return True
@@ -182,7 +187,7 @@ def test_readonly_protection(client):
 def test_illegal_address(client):
     """读非法地址 0xFFFF 应返回异常码 0x02"""
     print("\n[Test 5] 非法地址异常")
-    rr = client.read_holding_registers(address=0xFFFF, count=1, slave=SLAVE_ID)
+    rr = client.read_holding_registers(address=0xFFFF, count=1, unit=SLAVE_ID)
     if rr.isError():
         print(f"  PASS: 收到预期异常: {rr}")
         return True
@@ -194,11 +199,11 @@ def test_coil_operations(client):
     """FC01/FC05 线圈读写"""
     print("\n[Test 6] 线圈操作 (FC01/FC05)")
 
-    wr = client.write_coil(address=0, value=True, slave=SLAVE_ID)
+    wr = client.write_coil(address=0, value=True, unit=SLAVE_ID)
     if wr.isError():
         print(f"  FAIL: 写线圈 0=ON: {wr}")
         return False
-    rr = client.read_coils(address=0, count=4, slave=SLAVE_ID)
+    rr = client.read_coils(address=0, count=4, unit=SLAVE_ID)
     if rr.isError():
         print(f"  FAIL: 读线圈: {rr}")
         return False
@@ -206,7 +211,7 @@ def test_coil_operations(client):
     ok = rr.bits[0] is True
     if not ok:
         print("  FAIL: 线圈 0 写 ON 后读回不匹配")
-    client.write_coil(address=0, value=False, slave=SLAVE_ID)
+    client.write_coil(address=0, value=False, unit=SLAVE_ID)
     return ok
 
 
@@ -257,7 +262,7 @@ def test_stress(client, count=200):
     for i in range(count):
         # 写一个值
         if client.write_register(address=REG_SAMPLE_INTV, value=(100 + i % 50),
-                                  slave=SLAVE_ID).isError():
+                                  unit=SLAVE_ID).isError():
             continue
         # 读回验证
         t0   = time.perf_counter()
@@ -311,10 +316,20 @@ def main():
     print(f"串口: {SERIAL_PORT}  波特率: {BAUDRATE}  从机地址: {SLAVE_ID}")
     print("=" * 60)
 
-    client = ModbusSerialClient(
-        port=SERIAL_PORT, baudrate=BAUDRATE,
-        bytesize=8, parity='N', stopbits=1, timeout=TIMEOUT,
-    )
+    # pymodbus 2.x: ModbusSerialClient(method='rtu', port=..., ...)
+    # pymodbus 3.x: ModbusSerialClient(port=..., ...)
+    import pymodbus
+    if int(pymodbus.__version__.split('.')[0]) < 3:
+        client = ModbusSerialClient(
+            method='rtu',
+            port=SERIAL_PORT, baudrate=BAUDRATE,
+            bytesize=8, parity='N', stopbits=1, timeout=TIMEOUT,
+        )
+    else:
+        client = ModbusSerialClient(
+            port=SERIAL_PORT, baudrate=BAUDRATE,
+            bytesize=8, parity='N', stopbits=1, timeout=TIMEOUT,
+        )
 
     if not client.connect():
         print(f"错误: 无法打开串口 {SERIAL_PORT}")
